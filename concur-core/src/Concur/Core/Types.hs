@@ -7,11 +7,9 @@
 {-# LANGUAGE TupleSections              #-}
 module Concur.Core.Types
   ( Widget(..)
-  , continue
   , display
   , mapView
   , wrapView
-  , SuspendF(..)
   , awaitViewAction
   , MultiAlternative(..)
   , loadWithIO
@@ -24,57 +22,60 @@ module Concur.Core.Types
 
 import           Control.Applicative      (Alternative, empty, (<|>))
 import           Control.Concurrent       (ThreadId, forkIO, killThread, newEmptyMVar, putMVar, takeMVar)
-import           Control.Concurrent.STM   (STM, TMVar, newEmptyTMVarIO, atomically, putTMVar, takeTMVar)
+import           Control.Concurrent.STM   (STM, TMVar, newEmptyTMVarIO, atomically, putTMVar, takeTMVar, retry)
 import           Control.Monad            (MonadPlus (..), forM)
 import           Control.Monad.Free       (Free (..), hoistFree, liftF)
 import           Control.Monad.IO.Class   (MonadIO, liftIO)
 import           Control.MultiAlternative (MultiAlternative, orr, never)
 
+import           Data.Bifunctor           (bimap)
+
 import qualified Concur.Core.Notify       as N
 
-data SuspendF v next
-  = StepView v next
-  | forall r. StepBlock (IO r) (r -> next)
-  | forall r. StepSTM   (STM r) (r -> next)
-  | forall r. StepIO    (IO r) (r -> next)
-  | Forever
+newtype Widget v a = Widget { runWidget :: STM (Maybe v, Either a (Widget v a)) }
 
-deriving instance Functor (SuspendF v)
+instance Functor (Widget v) where
+  fmap f (Widget w) = Widget $ do
+    (v, r) <- w
+    pure (v, bimap f (fmap f) r)
 
-newtype Widget v a = Widget { step :: Free (SuspendF v) a }
-  deriving (Functor, Applicative, Monad)
+instance Applicative (Widget v) where
+  pure a = Widget $ pure (Nothing, Left a)
+  f <*> a = do
+    f' <- f
+    a' <- a
+    pure (f' a')
 
-view :: v -> Widget v ()
-view v = Widget $ liftF $ StepView v ()
+instance Monad (Widget v) where
+  Widget w >>= f = Widget $ do
+    (v, r) <- w
+    pure $ (,) v $ case r of
+      Left a   -> Right (f a)
+      Right w' -> Right (w' >>= f)
+
+view :: v -> Widget v a
+view v = Widget (pure (Just v, Right $ Widget retry))
 
 effect :: IO a -> Widget v a
-effect a = Widget $ liftF $ StepBlock a id
+effect a = undefined
 
 io :: IO a ->  Widget v a
-io a = Widget $ liftF $ StepIO a id
+io a = undefined
 
 liftSTM :: STM a ->  Widget v a
-liftSTM a = Widget $ liftF $ StepSTM a id
+liftSTM stm = Widget (stm >>= \a -> pure (Nothing, Left a))
 
 forever :: Widget v a
-forever = Widget $ liftF Forever
-
-continue :: SuspendF v a -> Widget v a
-continue = Widget . liftF
+forever = Widget retry
 
 display :: v -> Widget v a
 display v = view v >> forever
 
 -- Change the view of a Widget
 mapView :: (u -> v) -> Widget u a -> Widget v a
-mapView f (Widget w) = Widget $ go w
-  where
-    go = hoistFree g
-    g (StepView v next)  = StepView (f v) next
-    g (StepIO a next)    = StepIO a next
-    g (StepBlock a next) = StepBlock a next
-    g (StepSTM a next)   = StepSTM a next
-    g Forever            = Forever
+mapView f (Widget w) = Widget $ do
+  (v, r) <- w
+  pure (f <$> v, mapView f <$> r)
 
 -- Generic widget view wrapper
 wrapView :: Applicative f => (u -> v) -> Widget u a -> Widget (f v) a
@@ -89,7 +90,7 @@ unsafeBlockingIO = io
 awaitViewAction :: (N.Notify a -> v) -> Widget v a
 awaitViewAction f = do
   n <- io N.newNotify
-  view (f n)
+  _ <- view (f n)
   effect $ N.await n
 
 {-# DEPRECATED loadWithIO "Just use liftIO instead" #-}
@@ -119,78 +120,19 @@ instance Monoid v => Alternative (Widget v) where
   empty = never
   f <|> g = orr [f,g]
 
-stepW :: v -> Free (SuspendF v) a -> IO (Either a (v, Maybe (Either (STM (Free (SuspendF v) a)) (IO (Free (SuspendF v) a)))))
-stepW _ (Free (StepView v next))  = stepW v next
-stepW v (Free (StepIO a next))    = a >>= stepW v . next
-stepW v (Free (StepBlock a next)) = pure $ Right (v, Just $ Right (a >>= pure . next))
-stepW v (Free (StepSTM a next))   = pure $ Right (v, Just $ Left (a >>= pure . next))
-stepW v (Free Forever)            = pure $ Right (v, Nothing)
-stepW _ (Pure a)                  = pure $ Left a
-
 instance Monoid v => MultiAlternative (Widget v) where
   never = display mempty
 
-  -- Single child fast path without threads
-  orr [w] = go (step w)
+  orr ws' = go (replicate (length ws') Nothing) ws'
     where
-      go widget = do
-        stepped <- io $ stepW mempty widget
+      go vs ws = Widget $ do
+        (i, (v, w)) <- foldr (<|>) retry [ (i,) <$> runWidget w | (i, w) <- zip [0..] ws ]
 
-        case stepped of
-          Left a                -> pure a
-          Right (v, Nothing)    -> view v >> forever
-          Right (v, Just (Left await)) -> do
-            view v
-            next <- liftSTM await
-            go next
-          Right (v, Just (Right await)) -> do
-            view v
-            next <- effect await
-            go next
+        let vs' = take i vs <> [(vs !! i) <|> v] <> drop (i + 1) vs
 
-  -- General threaded case
-  orr ws = do
-    mvar <- io newEmptyTMVarIO
-    comb mvar $ fmap (Left . step) ws
-    where
-      comb
-        :: TMVar (Int, Free (SuspendF v) a)
-        -> [Either (Free (SuspendF v) a) (v, Maybe ThreadId)] -> Widget v a
-      comb mvar widgets = do
-        stepped <- io $ forM widgets $ \w -> case w of
-          Left suspended         -> either Left (Right . Left) <$> stepW mempty suspended
-          Right (displayed, tid) -> pure $ Right $ Right (displayed, tid)
-  
-        case sequence stepped of
-          -- A widget finished, kill all running threads
-          Left a -> do
-            io $ sequence_
-              [ killThread tid
-              | Right (Right (_, Just tid)) <- stepped
-              ]
-            pure a
-          Right next -> do
-            -- Display all current views
-            view $ mconcat $ map (either fst fst) next
-
-            tids <- io $ forM (zip [0..] next) $ \(i, v) -> case v of
-              -- Start a new thread on encountering StepBlock
-              Left (dv, Just (Left await)) -> fmap (Right . (dv,) . Just) $ forkIO $ atomically $ do
-                a <- await
-                putTMVar mvar (i, a)
-
-              Left (dv, Just (Right await)) -> fmap (Right . (dv,) . Just) $ forkIO $ do
-                a <- await
-                atomically $ putTMVar mvar (i, a)
-
-              -- Neverending Widget, pass on
-              Left  (dv, Nothing)   -> pure $ Right (dv, Nothing)
-
-              -- Already running, pass on
-              Right (dv, tid)       -> pure $ Right (dv, tid)
-                  
-            (i, newWidget) <- liftSTM $ takeTMVar mvar
-            comb mvar (take i tids ++ [Left newWidget] ++ drop (i + 1) tids)
+        pure $ (,) (mconcat vs') $ case w of
+          Left a -> Left a
+          Right w' -> Right $ orr (take i ws <> [w'] <> drop (i + 1) ws)
 
 -- The default instance derives from Alternative
 instance Monoid v => MonadPlus (Widget v)
