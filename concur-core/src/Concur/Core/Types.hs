@@ -104,7 +104,7 @@ instance Monoid v => MultiAlternative (Widget v) where
           Left a   -> Left a
           Right w' -> Right $ do
             w'' <- w'
-            pure $ orr (take i ws <> [w''] <> drop (i + 1) ws)
+            pure $ go vs' (take i ws <> [w''] <> drop (i + 1) ws)
 
 -- The default instance derives from Alternative
 instance Monoid v => MonadPlus (Widget v)
