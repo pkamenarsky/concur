@@ -93,15 +93,17 @@ instance Monoid v => Alternative (Widget v) where
 instance Monoid v => MultiAlternative (Widget v) where
   never = forever
 
-  orr ws' = go (replicate (length ws') Nothing) ws'
+  orr ws' = go (replicate (length ws') mempty) ws'
     where
       go vs ws = Widget $ do
         (i, (v, w)) <- foldr (<|>) retry [ (i,) <$> runWidget w | (i, w) <- zip [0..] ws ]
 
-        let vs' = take i vs <> [v <|> vs !! i] <> drop (i + 1) vs
+        let vs' = case v of
+              Nothing  -> vs
+              Just v'' -> take i vs <> [v''] <> drop (i + 1) vs
             v'  = case v of
               Nothing -> Nothing
-              Just _  -> mconcat vs'
+              Just _  -> Just (mconcat vs')
 
         pure $ (,) v' $ case w of
           Left a   -> Left a
