@@ -98,7 +98,7 @@ instance Monoid v => MultiAlternative (Widget v) where
       go vs ws = Widget $ do
         (i, (v, w)) <- foldr (<|>) retry [ (i,) <$> runWidget w | (i, w) <- zip [0..] ws ]
 
-        let vs' = take i vs <> [v' <|> vs !! i] <> drop (i + 1) vs
+        let vs' = take i vs <> [v <|> vs !! i] <> drop (i + 1) vs
             v'  = case v of
               Nothing -> Nothing
               Just _  -> mconcat vs'
