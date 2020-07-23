@@ -9,6 +9,7 @@ module Concur.Core.Types
   ( Widget(..)
   , mapView
   , wrapView
+  , MonadUnsafeBlockingIO(..)
   , MultiAlternative(..)
   , liftSTM
   , view
@@ -76,6 +77,14 @@ wrapView f = mapView (pure . f)
 
 instance Monoid v => MonadIO (Widget v) where
   liftIO = effect
+
+class MonadUnsafeBlockingIO m where
+  liftUnsafeBlockingIO :: IO a -> m a
+
+instance MonadUnsafeBlockingIO (Widget v) where
+  liftUnsafeBlockingIO io = Widget $ pure $ (,) Nothing $ Right $ do
+    a <- io
+    pure $ Widget $ pure (Nothing, Left a)
 
 instance Monoid v => Alternative (Widget v) where
   empty = never
