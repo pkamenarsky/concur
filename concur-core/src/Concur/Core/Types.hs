@@ -96,7 +96,7 @@ instance Monoid v => MultiAlternative (Widget v) where
   orr ws' = go (replicate (length ws') mempty) ws'
     where
       go vs ws = Widget $ do
-        (i, (v, w)) <- foldr (<|>) retry [ (i,) <$> runWidget w | (i, w) <- zip [0..] ws ]
+        (i, (v, w)) <- foldl (<|>) retry [ (i,) <$> runWidget w | (i, w) <- zip [0..] ws ]
 
         let vs' = case v of
               Nothing  -> vs
